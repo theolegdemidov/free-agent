@@ -23,6 +23,7 @@ MAX_MESSAGES = int(os.getenv("AGENT_MAX_MESSAGES", "40"))  # без system-со�
 AUTO_YES_ENV = os.getenv("AGENT_AUTO_YES", "") == "1"
 RETRY_STATUSES = {429, 500, 502, 503, 504}
 MAX_RETRIES = 3
+MAX_FILE_BYTES = int(os.getenv("AGENT_MAX_FILE_BYTES", str(1_000_000)))  # защита от гигантских ответов модели
 
 FILE_RE = re.compile(r"<<<FILE (?P<path>[^\n>]+)>>>\n(?P<body>.*?)\n?<<<END>>>", re.S)
 
@@ -57,11 +58,15 @@ def safe_path(rel):
     path = (WORKSPACE / rel).resolve()
     if path != WORKSPACE and WORKSPACE not in path.parents:
         raise ValueError(f"Путь вне workspace: {rel}")
+    if path.name.startswith(".history") or path == HISTORY_FILE.resolve():
+        raise ValueError(f"Файл истории защищён от записи моделью: {rel}")
     return path
 
 
 def write_file(rel, body):
     path = safe_path(rel)
+    if len(body.encode("utf-8")) > MAX_FILE_BYTES:
+        raise ValueError(f"Файл {rel} больше {MAX_FILE_BYTES} байт, не записываю")
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(body, encoding="utf-8")
     return path
@@ -192,10 +197,23 @@ def md_to_pdf(md_rel, pdf_rel=None):
 
 # ---------- цикл ----------
 
-def handle_reply(reply, auto_yes=False):
+def handle_reply(reply, auto_yes=False, overwrite=False):
+    """Записывает файлы из ответа модели. Существующие файлы без явного разрешения не перезаписываются:
+    в интерактивном режиме спрашиваем отдельно, с --yes пропускаем, пока не передан --overwrite."""
     for rel, body in parse_file_blocks(reply):
-        if not auto_yes and input(f"Записать файл {rel}? [y/N] ").lower() != "y":
+        try:
+            exists = safe_path(rel).exists()
+        except ValueError as exc:
+            print("Пропущено:", exc)
             continue
+        if auto_yes:
+            if exists and not overwrite:
+                print(f"Пропущено: {rel} уже существует (запусти с --overwrite, чтобы заменять)")
+                continue
+        else:
+            question = f"Файл {rel} уже существует. Перезаписать? [y/N] " if exists else f"Записать файл {rel}? [y/N] "
+            if input(question).lower() != "y":
+                continue
         try:
             print("Сохранён:", write_file(rel, body))
         except (ValueError, OSError) as exc:
@@ -204,6 +222,7 @@ def handle_reply(reply, auto_yes=False):
 
 def main():
     auto_yes = AUTO_YES_ENV or "--yes" in sys.argv
+    overwrite = "--overwrite" in sys.argv
     WORKSPACE.mkdir(parents=True, exist_ok=True)
     messages = load_history()
     print(f"free-agent | {MODEL} @ {BASE_URL} | workspace: {WORKSPACE}")
@@ -251,7 +270,7 @@ def main():
         except OSError as exc:
             print("Не удалось сохранить историю:", exc)
         print("\nИИ>", reply)
-        handle_reply(reply, auto_yes)
+        handle_reply(reply, auto_yes, overwrite)
 
 
 if __name__ == "__main__":
